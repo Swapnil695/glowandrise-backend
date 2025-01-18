@@ -1,0 +1,122 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+    types:
+      - closed
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout code
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Configure AWS CLI
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.SES_REGION }}
+
+      # Log in to Amazon ECR
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Determine Version and Increment
+      - name: Get Current Version
+        id: current-version
+        run: |
+          if [ ! -f version.txt ]; then
+            echo "1.0" > version.txt
+          fi
+          current_version=$(cat version.txt)
+          echo "current_version=$current_version" >> $GITHUB_ENV
+
+      - name: Increment Version
+        id: increment-version
+        run: |
+          major=$(echo $current_version | cut -d '.' -f 1)
+          minor=$(echo $current_version | cut -d '.' -f 2)
+          new_version="$major.$((minor + 1))"
+          echo $new_version > version.txt
+          echo "new_version=$new_version" >> $GITHUB_ENV
+
+      # Commit Updated Version File
+      - name: Commit New Version
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add version.txt
+          git commit -m "Bump version to ${{ env.new_version }}"
+          git push
+
+      # Build, Tag, and Push Docker Image
+      - name: Build and Push Docker Image
+        run: |
+          REPO_URI=442042525062.dkr.ecr.ap-south-1.amazonaws.com/glowandrise # Replace with your ECR URI
+          docker build -t $REPO_URI:glowandrise-${{ env.new_version }} .
+          docker tag $REPO_URI:glowandrise-${{ env.new_version }} $REPO_URI:latest
+          docker push $REPO_URI:glowandrise-${{ env.new_version }}
+          docker push $REPO_URI:latest
+
+      # Register New Task Definition
+      - name: Register New Task Definition
+        run: |
+          NEW_TASK_DEFINITION=$(aws ecs register-task-definition \
+              --family glowandrise \
+              --execution-role-arn arn:aws:iam::442042525062:role/ecsTaskExecutionRole \
+              --network-mode awsvpc \
+              --requires-compatibilities FARGATE \
+              --cpu 1024 \
+              --memory 3072 \
+              --container-definitions "$(cat <<EOF
+            [
+              {
+                "name": "glowandrise",
+                "image": "442042525062.dkr.ecr.ap-south-1.amazonaws.com/glowandrise:${{ env.new_version }}",
+                "cpu": 0,
+                "portMappings": [
+                  {
+                    "name": "8080",
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp",
+                    "appProtocol": "http"
+                  }
+                ],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/glowandrise",
+                    "mode": "non-blocking",
+                    "awslogs-create-group": "true",
+                    "awslogs-region": "ap-south-1",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                }
+              }
+            ]
+            EOF
+            )")
+          
+            echo "Task Definition ARN: $NEW_TASK_DEFINITION"
+
+      # Deploy to ECS
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: $NEW_TASK_DEFINITION # Register the new task definition
+          service: glowandrise
+          cluster: Glowandrise
+          wait-for-service-stability: true
